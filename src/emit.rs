@@ -30,7 +30,7 @@ fn emit(schema: &InferredSchema) -> Value {
 
         InferredSchema::Array { items, nullable } => emit_array(items, *nullable),
 
-        InferredSchema::Object { fields, nullable } => emit_object(fields, *nullable),
+        InferredSchema::Object { fields, nullable, .. } => emit_object(fields, *nullable),
 
         InferredSchema::Map { value_schema, nullable } => emit_map(value_schema, *nullable),
 

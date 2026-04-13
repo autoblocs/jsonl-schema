@@ -81,7 +81,7 @@ fn infer_object(
         );
     }
 
-    InferredSchema::Object { fields, nullable: false }
+    InferredSchema::Object { fields, observation_count: 1, nullable: false }
 }
 
 // ---------------------------------------------------------------------------
@@ -96,7 +96,7 @@ mod tests {
     fn cfg() -> InferConfig {
         InferConfig {
             max_depth: 20,
-            merge: MergeConfig { cap_union: 5 },
+            merge: MergeConfig { cap_union: 5, map_threshold: 20 },
         }
     }
 
