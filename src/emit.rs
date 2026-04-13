@@ -12,6 +12,7 @@ use crate::schema::{InferredSchema, ScalarType};
 ///                if all variants are scalar; otherwise `anyOf`
 /// - `Object`  → `{ "type": "object", "properties": {...} }`
 ///               `required` array is intentionally omitted per spec
+/// - `Map`     → `{ "type": "object", "additionalProperties": {...} }`
 /// - `Array`   → `{ "type": "array", "items": {...} }`
 ///               items=Never (empty array observed) → omit `items` key
 pub fn to_json_schema(schema: &InferredSchema) -> Value {
@@ -30,6 +31,8 @@ fn emit(schema: &InferredSchema) -> Value {
         InferredSchema::Array { items, nullable } => emit_array(items, *nullable),
 
         InferredSchema::Object { fields, nullable } => emit_object(fields, *nullable),
+
+        InferredSchema::Map { value_schema, nullable } => emit_map(value_schema, *nullable),
 
         InferredSchema::Union { variants, nullable } => emit_union(variants, *nullable),
     }
@@ -98,6 +101,23 @@ fn emit_object(
     // additionalProperties intentionally omitted — we never want to reject
     // fields we haven't seen. The inferred schema is descriptive, not prescriptive.
 
+    Value::Object(obj)
+}
+
+// ---------------------------------------------------------------------------
+// Map
+// ---------------------------------------------------------------------------
+
+fn emit_map(value_schema: &InferredSchema, nullable: bool) -> Value {
+    let mut obj = Map::new();
+
+    if nullable {
+        obj.insert("type".into(), json!(["object", "null"]));
+    } else {
+        obj.insert("type".into(), json!("object"));
+    }
+
+    obj.insert("additionalProperties".into(), emit(value_schema));
     Value::Object(obj)
 }
 

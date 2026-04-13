@@ -74,6 +74,15 @@ pub enum InferredSchema {
         nullable: bool,
     },
 
+    /// A dynamic map: string keys → uniform value schema.
+    /// Triggered when an Object node accumulates more than `map_threshold`
+    /// distinct keys across all observed records.
+    /// Emits as `{ "type": "object", "additionalProperties": { ... } }`.
+    Map {
+        value_schema: Box<InferredSchema>,
+        nullable: bool,
+    },
+
     /// A union of scalars only (never Object or Array).
     /// Object+Scalar or Array+Scalar → Any immediately.
     Union {
@@ -92,6 +101,7 @@ impl InferredSchema {
             InferredSchema::Scalar   { nullable, .. } => *nullable,
             InferredSchema::Array    { nullable, .. } => *nullable,
             InferredSchema::Object   { nullable, .. } => *nullable,
+            InferredSchema::Map      { nullable, .. } => *nullable,
             InferredSchema::Union    { nullable, .. } => *nullable,
         }
     }
@@ -105,6 +115,7 @@ impl InferredSchema {
             InferredSchema::Scalar   { ty, .. }               => InferredSchema::Scalar   { ty,      nullable: true },
             InferredSchema::Array    { items, .. }            => InferredSchema::Array    { items,   nullable: true },
             InferredSchema::Object   { fields, .. }           => InferredSchema::Object   { fields,  nullable: true },
+            InferredSchema::Map      { value_schema, .. }     => InferredSchema::Map      { value_schema, nullable: true },
             InferredSchema::Union    { variants, .. }         => InferredSchema::Union    { variants, nullable: true },
         }
     }
