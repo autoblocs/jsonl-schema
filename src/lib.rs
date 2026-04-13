@@ -25,6 +25,8 @@ pub struct Config {
     pub dirs: Vec<PathBuf>,
     pub max_depth: usize,
     pub cap_union: usize,
+    /// Maximum distinct keys before an Object flips to a Map. 0 = disabled.
+    pub map_threshold: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -62,7 +64,7 @@ pub fn run(cfg: &Config) -> Result<InferResult, SchemaError> {
     let file_count = files.len();
     let infer_cfg = InferConfig {
         max_depth: cfg.max_depth,
-        merge: MergeConfig { cap_union: cfg.cap_union },
+        merge: MergeConfig { cap_union: cfg.cap_union, map_threshold: cfg.map_threshold },
     };
 
     let mut acc = Accumulator::default();
@@ -165,7 +167,7 @@ mod tests {
     }
 
     fn config(dirs: Vec<PathBuf>) -> Config {
-        Config { dirs, max_depth: 20, cap_union: 5 }
+        Config { dirs, max_depth: 20, cap_union: 5, map_threshold: 20 }
     }
 
     #[test]
@@ -337,6 +339,44 @@ NOT JSON AT ALL
         let items_schema = &result.schema["properties"]["items"]["items"];
         assert_eq!(items_schema["type"], "object");
         assert_eq!(items_schema["properties"]["id"]["type"], "integer");
+    }
+
+    #[test]
+    fn map_threshold_flips_object_to_map() {
+        let tmp = tmp_dir();
+        // Build an object with 6 distinct keys across records, threshold=5
+        let lines: String = (0..6)
+            .map(|i| format!("{{"key_{i}": {i}}}
+"))
+            .collect();
+        fs::write(tmp.path().join("data.jsonl"), lines).unwrap();
+
+        let mut cfg = config(vec![tmp.path().to_path_buf()]);
+        cfg.map_threshold = 5;
+        let result = run(&cfg).unwrap();
+
+        // Should have additionalProperties, not properties
+        assert!(result.schema.get("additionalProperties").is_some(),
+            "expected additionalProperties, got: {}", result.schema);
+        assert!(result.schema.get("properties").is_none());
+    }
+
+    #[test]
+    fn map_threshold_disabled_at_zero() {
+        let tmp = tmp_dir();
+        let lines: String = (0..50)
+            .map(|i| format!("{{"key_{i}": {i}}}
+"))
+            .collect();
+        fs::write(tmp.path().join("data.jsonl"), lines).unwrap();
+
+        let mut cfg = config(vec![tmp.path().to_path_buf()]);
+        cfg.map_threshold = 0; // disabled
+        let result = run(&cfg).unwrap();
+
+        // Should stay as properties
+        assert!(result.schema.get("properties").is_some());
+        assert!(result.schema.get("additionalProperties").is_none());
     }
 
     #[test]

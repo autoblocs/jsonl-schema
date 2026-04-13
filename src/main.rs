@@ -29,6 +29,13 @@ struct Args {
     #[arg(long = "cap-union", default_value_t = 5, value_name = "N")]
     cap_union: usize,
 
+    /// Object-to-map threshold: if a single object node accumulates more than
+    /// N distinct keys across all records, it is inferred as a dynamic map
+    /// (additionalProperties) rather than a fixed-shape record (properties).
+    /// Set to 0 to disable.
+    #[arg(long = "map-threshold", default_value_t = 20, value_name = "N")]
+    map_threshold: usize,
+
     /// Output file path. If omitted, schema is printed to stdout.
     #[arg(long = "output", short = 'o', value_name = "FILE")]
     output: Option<PathBuf>,
@@ -50,9 +57,10 @@ fn main() {
     let args = Args::parse();
 
     let cfg = Config {
-        dirs:      args.dirs,
-        max_depth: args.depth,
-        cap_union: args.cap_union,
+        dirs:          args.dirs,
+        max_depth:     args.depth,
+        cap_union:     args.cap_union,
+        map_threshold: args.map_threshold,
     };
 
     match run(&cfg) {
