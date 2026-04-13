@@ -1,0 +1,28 @@
+[package]
+name = "jsonl-schema"
+version = "0.1.0"
+edition = "2021"
+description = "Infer a unified JSON Schema from one or more directories of JSONL files"
+
+[[bin]]
+name = "jsonl-schema"
+path = "src/main.rs"
+
+[lib]
+name = "jsonl_schema"
+path = "src/lib.rs"
+
+[dependencies]
+serde_json = "1"
+indexmap   = { version = "2", features = ["serde"] }
+clap       = { version = "4", features = ["derive"] }
+thiserror  = "1"
+walkdir    = "2"
+
+[profile.release]
+opt-level = 3
+lto       = true
+codegen-units = 1
+
+[dev-dependencies]
+tempfile = "3"
