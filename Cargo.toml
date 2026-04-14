@@ -26,3 +26,4 @@ codegen-units = 1
 
 [dev-dependencies]
 tempfile = "3"
+rayon      = "1"

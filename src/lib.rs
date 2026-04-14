@@ -9,6 +9,7 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::fs::File;
 
+use rayon::prelude::*;
 use serde_json::Value;
 
 use crate::error::{SchemaError, Warning};
@@ -27,6 +28,8 @@ pub struct Config {
     pub cap_union: usize,
     /// Maximum distinct keys before an Object flips to a Map. 0 = disabled.
     pub map_threshold: usize,
+    /// Number of threads. 0 = rayon default (logical CPU count).
+    pub threads: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -43,17 +46,20 @@ pub struct InferResult {
 }
 
 // ---------------------------------------------------------------------------
+// Per-file intermediate result
+// ---------------------------------------------------------------------------
+
+struct FileResult {
+    schema: InferredSchema,
+    record_count: u64,
+    warning_count: u64,
+    warnings: Vec<Warning>,
+}
+
+// ---------------------------------------------------------------------------
 // Main entry point
 // ---------------------------------------------------------------------------
 
-/// Run the full pipeline:
-///   1. Discover .jsonl files under `cfg.dirs`
-///   2. Stream-parse each file line by line
-///   3. Fold all records into a single `InferredSchema` via LUB
-///   4. Emit JSON Schema
-///
-/// Warnings are collected and returned — never printed by this function.
-/// Callers decide how to surface them.
 pub fn run(cfg: &Config) -> Result<InferResult, SchemaError> {
     let files = discover::collect_jsonl_files(&cfg.dirs)?;
 
@@ -64,43 +70,67 @@ pub fn run(cfg: &Config) -> Result<InferResult, SchemaError> {
     let file_count = files.len();
     let infer_cfg = InferConfig {
         max_depth: cfg.max_depth,
-        merge: MergeConfig { cap_union: cfg.cap_union, map_threshold: cfg.map_threshold },
+        merge: MergeConfig {
+            cap_union: cfg.cap_union,
+            map_threshold: cfg.map_threshold,
+        },
     };
 
-    let mut acc = Accumulator::default();
+    // Build thread pool — custom size if requested, otherwise rayon default.
+    let pool = {
+        let mut builder = rayon::ThreadPoolBuilder::new();
+        if cfg.threads > 0 {
+            builder = builder.num_threads(cfg.threads);
+        }
+        builder.build().map_err(|e| SchemaError::ThreadPool(e.to_string()))?
+    };
+
+    // Phase 1: process each file in parallel, producing one FileResult each.
+    let file_results: Vec<FileResult> = pool.install(|| {
+        files
+            .par_iter()
+            .map(|path| process_file(path, infer_cfg))
+            .collect::<Result<Vec<_>, SchemaError>>()
+    })?;
+
+    // Phase 2: sequential reduction of partial schemas via LUB.
+    // N here is file count, not record count — fast regardless.
+    let mut root = InferredSchema::Never;
+    let mut record_count: u64 = 0;
+    let mut warning_count: u64 = 0;
     let mut warnings: Vec<Warning> = Vec::new();
 
-    for file in &files {
-        process_file(file, &mut acc, &mut warnings, infer_cfg)?;
+    for fr in file_results {
+        root = lub(root, fr.schema, infer_cfg.merge);
+        record_count += fr.record_count;
+        warning_count += fr.warning_count;
+        warnings.extend(fr.warnings);
     }
 
-    let schema = emit::to_json_schema(&acc.root);
+    let schema = emit::to_json_schema(&root);
 
     Ok(InferResult {
         schema,
-        record_count: acc.record_count,
+        record_count,
         file_count,
-        warning_count: acc.warning_count,
+        warning_count,
         warnings,
     })
 }
 
 // ---------------------------------------------------------------------------
-// File processor (streaming)
+// File processor — runs inside the thread pool
 // ---------------------------------------------------------------------------
 
-fn process_file(
-    path: &Path,
-    acc: &mut Accumulator,
-    warnings: &mut Vec<Warning>,
-    cfg: InferConfig,
-) -> Result<(), SchemaError> {
+fn process_file(path: &Path, cfg: InferConfig) -> Result<FileResult, SchemaError> {
     let file = File::open(path).map_err(|e| SchemaError::Io {
         path: path.to_path_buf(),
         source: e,
     })?;
 
     let reader = BufReader::new(file);
+    let mut acc = Accumulator::default();
+    let mut warnings: Vec<Warning> = Vec::new();
 
     for (line_idx, line_result) in reader.lines().enumerate() {
         let line_number = line_idx + 1;
@@ -119,13 +149,10 @@ fn process_file(
         };
 
         let trimmed = line.trim();
-
-        // Skip blank lines
         if trimmed.is_empty() {
             continue;
         }
 
-        // Parse JSON
         let value: Value = match serde_json::from_str(trimmed) {
             Ok(v) => v,
             Err(e) => {
@@ -139,7 +166,6 @@ fn process_file(
             }
         };
 
-        // Infer schema for this record and fold into accumulator
         let record_schema = infer_value(&value, cfg.max_depth, cfg);
         acc.root = lub(
             std::mem::replace(&mut acc.root, InferredSchema::Never),
@@ -149,7 +175,12 @@ fn process_file(
         acc.record_count += 1;
     }
 
-    Ok(())
+    Ok(FileResult {
+        schema: acc.root,
+        record_count: acc.record_count,
+        warning_count: acc.warning_count,
+        warnings,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -167,7 +198,13 @@ mod tests {
     }
 
     fn config(dirs: Vec<PathBuf>) -> Config {
-        Config { dirs, max_depth: 20, cap_union: 5, map_threshold: 20 }
+        Config {
+            dirs,
+            max_depth: 20,
+            cap_union: 5,
+            map_threshold: 20,
+            threads: 1,
+        }
     }
 
     #[test]
@@ -179,11 +216,9 @@ mod tests {
 {"name":"bob","age":25}
 "#,
         ).unwrap();
-
         let result = run(&config(vec![tmp.path().to_path_buf()])).unwrap();
         assert_eq!(result.record_count, 2);
         assert_eq!(result.warning_count, 0);
-
         let props = &result.schema["properties"];
         assert_eq!(props["name"]["type"], "string");
         assert_eq!(props["age"]["type"], "integer");
@@ -198,11 +233,8 @@ mod tests {
 {"x":null}
 "#,
         ).unwrap();
-
         let result = run(&config(vec![tmp.path().to_path_buf()])).unwrap();
-        let x_type = &result.schema["properties"]["x"]["type"];
-        // Should be ["integer","null"] in some order
-        let arr = x_type.as_array().unwrap();
+        let arr = result.schema["properties"]["x"]["type"].as_array().unwrap();
         assert!(arr.contains(&serde_json::json!("integer")));
         assert!(arr.contains(&serde_json::json!("null")));
     }
@@ -210,16 +242,13 @@ mod tests {
     #[test]
     fn missing_field_across_records() {
         let tmp = tmp_dir();
-        // "y" only appears in record 2
         fs::write(
             tmp.path().join("data.jsonl"),
             r#"{"x":1}
 {"x":2,"y":"hello"}
 "#,
         ).unwrap();
-
         let result = run(&config(vec![tmp.path().to_path_buf()])).unwrap();
-        // "y" should exist in properties but x should be non-nullable
         let props = &result.schema["properties"];
         assert!(props.get("y").is_some());
         assert_eq!(props["x"]["type"], "integer");
@@ -235,7 +264,6 @@ NOT JSON AT ALL
 {"x":3}
 "#,
         ).unwrap();
-
         let result = run(&config(vec![tmp.path().to_path_buf()])).unwrap();
         assert_eq!(result.record_count, 2);
         assert_eq!(result.warning_count, 1);
@@ -251,7 +279,6 @@ NOT JSON AT ALL
 {"x":2}
 "#,
         ).unwrap();
-
         let result = run(&config(vec![tmp.path().to_path_buf()])).unwrap();
         assert_eq!(result.record_count, 2);
         assert_eq!(result.warning_count, 0);
@@ -259,7 +286,6 @@ NOT JSON AT ALL
 
     #[test]
     fn bare_scalar_records() {
-        // JSONL where each line is a bare scalar, not an object
         let tmp = tmp_dir();
         fs::write(
             tmp.path().join("scalars.jsonl"),
@@ -268,11 +294,9 @@ NOT JSON AT ALL
 "world"
 "#,
         ).unwrap();
-
         let result = run(&config(vec![tmp.path().to_path_buf()])).unwrap();
         assert_eq!(result.record_count, 3);
         assert_eq!(result.warning_count, 0);
-        // LUB(Str, Integer, Str) = Union(Str, Integer)
         let types = result.schema["type"].as_array().unwrap();
         assert!(types.contains(&serde_json::json!("string")));
         assert!(types.contains(&serde_json::json!("integer")));
@@ -287,9 +311,7 @@ NOT JSON AT ALL
 {"x":3.14}
 "#,
         ).unwrap();
-
         let result = run(&config(vec![tmp.path().to_path_buf()])).unwrap();
-        // Integer + Float → Float (number in JSON Schema)
         assert_eq!(result.schema["properties"]["x"]["type"], "number");
     }
 
@@ -302,7 +324,6 @@ NOT JSON AT ALL
 {"v":"hello"}
 "#,
         ).unwrap();
-
         let result = run(&config(vec![tmp.path().to_path_buf()])).unwrap();
         let types = result.schema["properties"]["v"]["type"].as_array().unwrap();
         assert!(types.contains(&serde_json::json!("integer")));
@@ -318,7 +339,6 @@ NOT JSON AT ALL
 {"user":{"id":2,"name":"bob"}}
 "#,
         ).unwrap();
-
         let result = run(&config(vec![tmp.path().to_path_buf()])).unwrap();
         let user = &result.schema["properties"]["user"];
         assert_eq!(user["type"], "object");
@@ -334,7 +354,6 @@ NOT JSON AT ALL
             r#"{"items":[{"id":1},{"id":2}]}
 "#,
         ).unwrap();
-
         let result = run(&config(vec![tmp.path().to_path_buf()])).unwrap();
         let items_schema = &result.schema["properties"]["items"]["items"];
         assert_eq!(items_schema["type"], "object");
@@ -344,20 +363,18 @@ NOT JSON AT ALL
     #[test]
     fn map_threshold_flips_object_to_map() {
         let tmp = tmp_dir();
-        // Build an object with 6 distinct keys across records, threshold=5
         let lines: String = (0..6)
-            .map(|i| format!("{{"key_{i}": {i}}}
-"))
+            .map(|i| format!("{{\"key_{i}\": {i}}}\n"))
             .collect();
         fs::write(tmp.path().join("data.jsonl"), lines).unwrap();
-
         let mut cfg = config(vec![tmp.path().to_path_buf()]);
         cfg.map_threshold = 5;
         let result = run(&cfg).unwrap();
-
-        // Should have additionalProperties, not properties
-        assert!(result.schema.get("additionalProperties").is_some(),
-            "expected additionalProperties, got: {}", result.schema);
+        assert!(
+            result.schema.get("additionalProperties").is_some(),
+            "expected additionalProperties, got: {}",
+            result.schema
+        );
         assert!(result.schema.get("properties").is_none());
     }
 
@@ -365,18 +382,32 @@ NOT JSON AT ALL
     fn map_threshold_disabled_at_zero() {
         let tmp = tmp_dir();
         let lines: String = (0..50)
-            .map(|i| format!("{{"key_{i}": {i}}}
-"))
+            .map(|i| format!("{{\"key_{i}\": {i}}}\n"))
             .collect();
         fs::write(tmp.path().join("data.jsonl"), lines).unwrap();
-
         let mut cfg = config(vec![tmp.path().to_path_buf()]);
-        cfg.map_threshold = 0; // disabled
+        cfg.map_threshold = 0;
         let result = run(&cfg).unwrap();
-
-        // Should stay as properties
         assert!(result.schema.get("properties").is_some());
         assert!(result.schema.get("additionalProperties").is_none());
+    }
+
+    #[test]
+    fn parallel_multiple_files_merged() {
+        let tmp1 = tmp_dir();
+        let tmp2 = tmp_dir();
+        fs::write(tmp1.path().join("a.jsonl"), r#"{"x":1}"#).unwrap();
+        fs::write(tmp2.path().join("b.jsonl"), r#"{"y":"hello"}"#).unwrap();
+        let mut cfg = config(vec![
+            tmp1.path().to_path_buf(),
+            tmp2.path().to_path_buf(),
+        ]);
+        cfg.threads = 2;
+        let result = run(&cfg).unwrap();
+        assert_eq!(result.record_count, 2);
+        let props = &result.schema["properties"];
+        assert!(props.get("x").is_some());
+        assert!(props.get("y").is_some());
     }
 
     #[test]
@@ -384,23 +415,5 @@ NOT JSON AT ALL
         let tmp = tmp_dir();
         let err = run(&config(vec![tmp.path().to_path_buf()]));
         assert!(matches!(err, Err(SchemaError::NoFilesFound)));
-    }
-
-    #[test]
-    fn multiple_dirs_merged() {
-        let tmp1 = tmp_dir();
-        let tmp2 = tmp_dir();
-        fs::write(tmp1.path().join("a.jsonl"), r#"{"x":1}"#).unwrap();
-        fs::write(tmp2.path().join("b.jsonl"), r#"{"y":"hello"}"#).unwrap();
-
-        let result = run(&config(vec![
-            tmp1.path().to_path_buf(),
-            tmp2.path().to_path_buf(),
-        ])).unwrap();
-
-        assert_eq!(result.record_count, 2);
-        let props = &result.schema["properties"];
-        assert!(props.get("x").is_some());
-        assert!(props.get("y").is_some());
     }
 }

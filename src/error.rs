@@ -18,6 +18,9 @@ pub enum SchemaError {
 
     #[error("JSON serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
+
+    #[error("Thread pool error: {0}")]
+    ThreadPool(String),
 }
 
 /// A non-fatal warning collected during processing.
