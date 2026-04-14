@@ -5,6 +5,7 @@ pub mod infer;
 pub mod map_paths;
 pub mod merge;
 pub mod schema;
+pub mod validate;
 
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
