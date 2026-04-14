@@ -29,12 +29,12 @@ struct Args {
     #[arg(long = "cap-union", default_value_t = 5, value_name = "N")]
     cap_union: usize,
 
-    /// Object-to-map threshold: if a single object node accumulates more than
-    /// N distinct keys across all records, it is inferred as a dynamic map
-    /// (additionalProperties) rather than a fixed-shape record (properties).
-    /// Set to 0 to disable.
-    #[arg(long = "map-threshold", default_value_t = 20, value_name = "N")]
-    map_threshold: usize,
+    /// Explicit dot-path(s) of object nodes to force-convert to Map
+    /// (additionalProperties), regardless of key count.
+    /// Dot-separated field names; use [] for array item descent.
+    /// Example: --map-paths snapshot.trackedFileBackups modelUsage
+    #[arg(long = "map-paths", value_name = "PATH", num_args = 0..)]
+    map_paths: Vec<String>,
 
     /// Number of threads for parallel file processing.
     /// Defaults to the number of logical CPUs when set to 0.
@@ -65,7 +65,7 @@ fn main() {
         dirs:          args.dirs,
         max_depth:     args.depth,
         cap_union:     args.cap_union,
-        map_threshold: args.map_threshold,
+        map_paths:     args.map_paths,
         threads:       args.threads,
     };
 

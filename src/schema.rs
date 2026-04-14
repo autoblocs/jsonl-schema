@@ -71,16 +71,11 @@ pub enum InferredSchema {
     Object {
         /// Preserves insertion order of first-seen fields.
         fields: IndexMap<String, FieldInfo>,
-        /// Number of times this object node was observed (i.e. how many records
-        /// have contributed to it). Used to detect dynamic maps: if distinct_keys
-        /// is much greater than observation_count, it's likely a map with varying keys.
-        observation_count: u64,
         nullable: bool,
     },
 
     /// A dynamic map: string keys → uniform value schema.
-    /// Triggered when an Object node accumulates more than `map_threshold`
-    /// distinct keys across all observed records.
+    /// Created by an explicit `--map-paths` override applied post-inference.
     /// Emits as `{ "type": "object", "additionalProperties": { ... } }`.
     Map {
         value_schema: Box<InferredSchema>,
@@ -118,7 +113,7 @@ impl InferredSchema {
             InferredSchema::Any      => InferredSchema::Any,
             InferredSchema::Scalar   { ty, .. }               => InferredSchema::Scalar   { ty,      nullable: true },
             InferredSchema::Array    { items, .. }            => InferredSchema::Array    { items,   nullable: true },
-            InferredSchema::Object   { fields, observation_count, .. } => InferredSchema::Object { fields, observation_count, nullable: true },
+            InferredSchema::Object   { fields, .. }           => InferredSchema::Object   { fields,  nullable: true },
             InferredSchema::Map      { value_schema, .. }     => InferredSchema::Map      { value_schema, nullable: true },
             InferredSchema::Union    { variants, .. }         => InferredSchema::Union    { variants, nullable: true },
         }
