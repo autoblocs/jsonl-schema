@@ -21,6 +21,19 @@ pub enum SchemaError {
 
     #[error("Thread pool error: {0}")]
     ThreadPool(String),
+
+    #[error("Failed to load schema from {0}: {1}")]
+    SchemaLoadError(PathBuf, String),
+
+    #[error("Invalid JSON schema: {0}")]
+    InvalidSchema(String),
+}
+
+#[derive(Debug, Clone)]
+pub struct ValidationError {
+    pub file: PathBuf,
+    pub line: usize,
+    pub reason: String,
 }
 
 /// A non-fatal warning collected during processing.
