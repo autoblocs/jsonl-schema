@@ -48,7 +48,7 @@ pub enum InferredSchema {
     /// No observations yet — identity element for LUB.
     Never,
 
-    /// Accepts anything: union cap exceeded, depth exceeded, or empty file.
+    /// Accepts anything: cap exceeded, depth exceeded, or empty file.
     Any,
 
     /// A single scalar type, possibly nullable.
@@ -82,10 +82,23 @@ pub enum InferredSchema {
         nullable: bool,
     },
 
-    /// A union of scalars only (never Object or Array).
-    /// Object+Scalar or Array+Scalar → Any immediately.
+    /// A union of scalar types only.
+    /// Produced by LUB of two incompatible scalars (e.g. String + Integer).
+    /// Emits as `{ "type": ["string", "integer"] }`.
     Union {
         variants: std::collections::BTreeSet<ScalarType>,
+        nullable: bool,
+    },
+
+    /// A structural anyOf: two or more types that are not all scalars.
+    /// Produced by LUB of structurally incompatible types, e.g.:
+    ///   LUB(String, Array)  → AnyOf([String, Array])
+    ///   LUB(Object, String) → AnyOf([Object, String])
+    ///   LUB(Array,  Object) → AnyOf([Array,  Object])
+    /// `cap_union` applies — exceeding it collapses to Any.
+    /// Emits as `{ "anyOf": [...] }`.
+    AnyOf {
+        variants: Vec<InferredSchema>,
         nullable: bool,
     },
 }
@@ -102,20 +115,22 @@ impl InferredSchema {
             InferredSchema::Object   { nullable, .. } => *nullable,
             InferredSchema::Map      { nullable, .. } => *nullable,
             InferredSchema::Union    { nullable, .. } => *nullable,
+            InferredSchema::AnyOf    { nullable, .. } => *nullable,
         }
     }
 
-    /// Promote this schema to nullable (returns a clone with nullable=true).
+    /// Promote this schema to nullable (returns owned value with nullable=true).
     pub fn into_nullable(self) -> Self {
         match self {
             InferredSchema::Never    => InferredSchema::NullOnly,
             InferredSchema::NullOnly => InferredSchema::NullOnly,
             InferredSchema::Any      => InferredSchema::Any,
-            InferredSchema::Scalar   { ty, .. }               => InferredSchema::Scalar   { ty,      nullable: true },
-            InferredSchema::Array    { items, .. }            => InferredSchema::Array    { items,   nullable: true },
-            InferredSchema::Object   { fields, .. }           => InferredSchema::Object   { fields,  nullable: true },
-            InferredSchema::Map      { value_schema, .. }     => InferredSchema::Map      { value_schema, nullable: true },
-            InferredSchema::Union    { variants, .. }         => InferredSchema::Union    { variants, nullable: true },
+            InferredSchema::Scalar   { ty, .. }           => InferredSchema::Scalar   { ty,           nullable: true },
+            InferredSchema::Array    { items, .. }         => InferredSchema::Array    { items,        nullable: true },
+            InferredSchema::Object   { fields, .. }        => InferredSchema::Object   { fields,       nullable: true },
+            InferredSchema::Map      { value_schema, .. }  => InferredSchema::Map      { value_schema, nullable: true },
+            InferredSchema::Union    { variants, .. }      => InferredSchema::Union    { variants,     nullable: true },
+            InferredSchema::AnyOf    { variants, .. }      => InferredSchema::AnyOf    { variants,     nullable: true },
         }
     }
 }
