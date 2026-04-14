@@ -5,10 +5,6 @@ use crate::schema::{FieldInfo, InferredSchema, ScalarType};
 #[derive(Debug, Clone, Copy)]
 pub struct MergeConfig {
     pub cap_union: usize,
-    /// Maximum number of distinct keys an Object node may accumulate before
-    /// being converted to a Map (additionalProperties) schema.
-    /// 0 = disabled.
-    pub map_threshold: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -58,12 +54,12 @@ pub fn lub(a: InferredSchema, b: InferredSchema, cfg: MergeConfig) -> InferredSc
             }
         }
 
-        // Two objects — field-wise recursive LUB, then check map threshold
-        (Object { fields: fa, observation_count: oa, nullable: na }, Object { fields: fb, observation_count: ob, nullable: nb }) => {
-            let fields = merge_fields(fa, fb, cfg);
-            let observation_count = oa + ob;
-            let nullable = na || nb;
-            maybe_flip_to_map(fields, observation_count, nullable, cfg)
+        // Two objects — field-wise recursive LUB
+        (Object { fields: fa, nullable: na }, Object { fields: fb, nullable: nb }) => {
+            Object {
+                fields: merge_fields(fa, fb, cfg),
+                nullable: na || nb,
+            }
         }
 
         // Map + Map — LUB the value schemas
@@ -76,8 +72,8 @@ pub fn lub(a: InferredSchema, b: InferredSchema, cfg: MergeConfig) -> InferredSc
 
         // Object + Map — promote the Object to a Map by merging all its field
         // schemas into the Map's value schema, then LUB with the other Map.
-        (Object { fields, nullable: no, .. }, Map { value_schema, nullable: nm })
-        | (Map { value_schema, nullable: nm }, Object { fields, nullable: no, .. }) => {
+        (Object { fields, nullable: no }, Map { value_schema, nullable: nm })
+        | (Map { value_schema, nullable: nm }, Object { fields, nullable: no }) => {
             let merged_value = fields
                 .into_values()
                 .fold(*value_schema, |acc, fi| lub(acc, fi.schema, cfg));
@@ -198,45 +194,6 @@ fn merge_fields(
     a
 }
 
-// ---------------------------------------------------------------------------
-// Map threshold enforcement
-// ---------------------------------------------------------------------------
-
-/// After merging two Object field maps, check whether the distinct keys suggest
-/// a dynamic map (varying keys per record) rather than a fixed-shape object.
-///
-/// A fixed-shape record with 40 stable fields seen 1000 times has:
-///   distinct_keys = 40, observation_count = 1000 → ratio ≈ 0.04 → stays Object
-///
-/// A dynamic map with 100 varying keys seen 100 times has:
-///   distinct_keys = 100, observation_count = 100 → ratio = 1.0 → flips to Map
-///
-/// Heuristic: flip if distinct_keys > observation_count * 2 AND distinct_keys > map_threshold.
-/// This ensures a map-like cardinality (keys vary per record) while respecting the threshold.
-pub fn maybe_flip_to_map(
-    fields: IndexMap<String, FieldInfo>,
-    observation_count: u64,
-    nullable: bool,
-    cfg: MergeConfig,
-) -> InferredSchema {
-    let distinct_keys = fields.len() as u64;
-    let should_flip = cfg.map_threshold > 0
-        && distinct_keys > cfg.map_threshold as u64
-        && distinct_keys > observation_count * 2;
-
-    if should_flip {
-        // Fold all field schemas into one unified value schema via LUB.
-        let value_schema = fields
-            .into_values()
-            .fold(InferredSchema::Never, |acc, fi| lub(acc, fi.schema, cfg));
-        InferredSchema::Map {
-            value_schema: Box::new(value_schema),
-            nullable,
-        }
-    } else {
-        InferredSchema::Object { fields, observation_count, nullable }
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -247,7 +204,7 @@ mod tests {
     use super::*;
     use InferredSchema::*;
 
-    fn cfg() -> MergeConfig { MergeConfig { cap_union: 5, map_threshold: 20 } }
+    fn cfg() -> MergeConfig { MergeConfig { cap_union: 5 } }
 
     #[test]
     fn never_is_identity() {
@@ -288,7 +245,7 @@ mod tests {
             ScalarType::Str,
         ];
         // cap=2 means >2 variants → Any
-        let small_cfg = MergeConfig { cap_union: 2, map_threshold: 20 };
+        let small_cfg = MergeConfig { cap_union: 2 };
         for ty in types {
             schema = lub(schema, Scalar { ty, nullable: false }, small_cfg);
         }
@@ -326,7 +283,7 @@ mod tests {
 
     #[test]
     fn structural_conflict_collapses_to_any() {
-        let o = Object { fields: indexmap::IndexMap::new(), observation_count: 1, nullable: false };
+        let o = Object { fields: indexmap::IndexMap::new(), nullable: false };
         let s = Scalar { ty: ScalarType::Str, nullable: false };
         assert!(matches!(lub(o, s, cfg()), Any));
     }
