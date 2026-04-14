@@ -19,6 +19,7 @@ clap       = { version = "4", features = ["derive"] }
 thiserror  = "1"
 walkdir    = "2"
 rayon      = "1"
+jsonschema = "0.16"
 
 [profile.release]
 opt-level = 3
