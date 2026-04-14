@@ -13,6 +13,7 @@ use crate::schema::{InferredSchema, ScalarType};
 /// - `Object`  → `{ "type": "object", "properties": {...} }`
 ///               `required` array is intentionally omitted per spec
 /// - `Map`     → `{ "type": "object", "additionalProperties": {...} }`
+/// - `AnyOf`  → `{ "anyOf": [...] }` with null folded in as a variant when nullable
 /// - `Array`   → `{ "type": "array", "items": {...} }`
 ///               items=Never (empty array observed) → omit `items` key
 pub fn to_json_schema(schema: &InferredSchema) -> Value {
@@ -30,11 +31,13 @@ fn emit(schema: &InferredSchema) -> Value {
 
         InferredSchema::Array { items, nullable } => emit_array(items, *nullable),
 
-        InferredSchema::Object { fields, nullable, .. } => emit_object(fields, *nullable),
+        InferredSchema::Object { fields, nullable } => emit_object(fields, *nullable),
 
         InferredSchema::Map { value_schema, nullable } => emit_map(value_schema, *nullable),
 
         InferredSchema::Union { variants, nullable } => emit_union(variants, *nullable),
+
+        InferredSchema::AnyOf { variants, nullable } => emit_anyof(variants, *nullable),
     }
 }
 
@@ -145,6 +148,27 @@ fn emit_union(
     }
 
     json!({ "type": types })
+}
+
+// ---------------------------------------------------------------------------
+// AnyOf
+// ---------------------------------------------------------------------------
+
+fn emit_anyof(variants: &[crate::schema::InferredSchema], nullable: bool) -> Value {
+    // Build the anyOf array by emitting each variant.
+    // Null is represented as a dedicated { "type": "null" } entry when nullable.
+    let mut any_of: Vec<Value> = variants.iter().map(emit).collect();
+
+    if nullable {
+        any_of.push(json!({ "type": "null" }));
+    }
+
+    // Single variant after folding (shouldn't normally happen, but be safe)
+    if any_of.len() == 1 {
+        return any_of.remove(0);
+    }
+
+    json!({ "anyOf": any_of })
 }
 
 // ---------------------------------------------------------------------------

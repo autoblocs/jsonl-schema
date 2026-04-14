@@ -30,13 +30,13 @@ pub fn lub(a: InferredSchema, b: InferredSchema, cfg: MergeConfig) -> InferredSc
         // Null seen in isolation — make the other side nullable
         (NullOnly, x) | (x, NullOnly) => x.into_nullable(),
 
-        // Two scalars — same type, numeric promotion, or true union
+        // Two scalars — same type, numeric promotion, or scalar Union
         (Scalar { ty: ta, nullable: na }, Scalar { ty: tb, nullable: nb }) => {
             let nullable = na || nb;
             match scalar_lub(ta, tb) {
                 // Same type or Integer+Float → single scalar
                 ScalarLub::Scalar(ty) => Scalar { ty, nullable },
-                // Incompatible types → start a Union
+                // Incompatible scalars → Union
                 ScalarLub::Union(ta, tb) => {
                     let mut variants = std::collections::BTreeSet::new();
                     variants.insert(ta);
@@ -83,7 +83,7 @@ pub fn lub(a: InferredSchema, b: InferredSchema, cfg: MergeConfig) -> InferredSc
             }
         }
 
-        // Two unions — merge variant sets, check cap
+        // Two scalar Unions — merge variant sets, check cap
         (Union { variants: va, nullable: na }, Union { variants: vb, nullable: nb }) => {
             let mut variants = va;
             variants.extend(vb);
@@ -102,10 +102,34 @@ pub fn lub(a: InferredSchema, b: InferredSchema, cfg: MergeConfig) -> InferredSc
             union_or_any(variants, nullable, cfg)
         }
 
-        // Object + Array, Object + Scalar, Array + Scalar — structural conflict.
-        // Any is the only sound upper bound. Nullability is irrelevant since
-        // Any already accepts null implicitly in our lattice.
-        _ => Any,
+        // AnyOf + AnyOf — merge variant vecs, deduplicate structurally, check cap
+        (AnyOf { variants: va, nullable: na }, AnyOf { variants: vb, nullable: nb }) => {
+            let nullable = na || nb;
+            let mut variants = va;
+            for v in vb {
+                anyof_insert(&mut variants, v, cfg);
+            }
+            anyof_or_any(variants, nullable, cfg)
+        }
+
+        // AnyOf + anything else — absorb the new type into the AnyOf
+        (AnyOf { variants, nullable: na }, other)
+        | (other, AnyOf { variants, nullable: na }) => {
+            let nullable = na || other.is_nullable();
+            let mut variants = variants;
+            anyof_insert(&mut variants, other, cfg);
+            anyof_or_any(variants, nullable, cfg)
+        }
+
+        // Structural conflict: two types that are not compatible and neither
+        // is already an AnyOf — promote to AnyOf([a, b]).
+        // Covers: Object+Scalar, Array+Scalar, Array+Object,
+        //         Union+Object, Union+Array, Map+Scalar, etc.
+        (a, b) => {
+            let nullable = a.is_nullable() || b.is_nullable();
+            let variants = vec![a, b];
+            anyof_or_any(variants, nullable, cfg)
+        }
     }
 }
 
@@ -134,7 +158,7 @@ fn scalar_lub(a: ScalarType, b: ScalarType) -> ScalarLub {
 }
 
 // ---------------------------------------------------------------------------
-// Union cap enforcement
+// Union (scalar) cap enforcement
 // ---------------------------------------------------------------------------
 
 /// If a union contains both Integer and Float, remove Integer (Float subsumes it).
@@ -149,11 +173,100 @@ fn union_or_any(
     nullable: bool,
     cfg: MergeConfig,
 ) -> InferredSchema {
-    if variants.len() > cfg.cap_union {
+    if cfg.cap_union > 0 && variants.len() > cfg.cap_union {
         InferredSchema::Any
     } else {
         InferredSchema::Union { variants, nullable }
     }
+}
+
+// ---------------------------------------------------------------------------
+// AnyOf cap enforcement and insertion
+// ---------------------------------------------------------------------------
+
+/// Insert `new` into an AnyOf variant list, merging into an existing
+/// compatible variant where possible rather than always appending.
+///
+/// Compatibility rules:
+/// - Scalar + existing Scalar  → LUB into a single Scalar or Union
+/// - Object + existing Object  → LUB field-wise (already handled upstream,
+///   but can arrive here via AnyOf+AnyOf merges)
+/// - Array  + existing Array   → LUB items
+/// - Everything else           → append as a new distinct variant
+fn anyof_insert(variants: &mut Vec<InferredSchema>, new: InferredSchema, cfg: MergeConfig) {
+    // Never contributes nothing
+    if matches!(new, InferredSchema::Never) {
+        return;
+    }
+    // Any poisons the whole AnyOf — caller will detect via anyof_or_any
+    if matches!(new, InferredSchema::Any) {
+        variants.push(new);
+        return;
+    }
+
+    // Try to merge `new` into an existing compatible variant.
+    for existing in variants.iter_mut() {
+        if can_merge_inline(existing, &new) {
+            let merged = lub(
+                std::mem::replace(existing, InferredSchema::Never),
+                new,
+                cfg,
+            );
+            *existing = merged;
+            return;
+        }
+    }
+
+    // No compatible existing variant — append as new.
+    variants.push(new);
+}
+
+/// Returns true if `a` and `b` are the same structural category
+/// (both Scalar/Union, both Object/Map, both Array) and should be
+/// merged inline rather than kept as separate AnyOf arms.
+fn can_merge_inline(a: &InferredSchema, b: &InferredSchema) -> bool {
+    use InferredSchema::*;
+    matches!(
+        (a, b),
+        (Scalar { .. }, Scalar { .. })
+        | (Scalar { .. }, Union { .. })
+        | (Union { .. }, Scalar { .. })
+        | (Union { .. }, Union { .. })
+        | (Object { .. }, Object { .. })
+        | (Object { .. }, Map { .. })
+        | (Map { .. }, Object { .. })
+        | (Map { .. }, Map { .. })
+        | (Array { .. }, Array { .. })
+    )
+}
+
+fn anyof_or_any(
+    variants: Vec<InferredSchema>,
+    nullable: bool,
+    cfg: MergeConfig,
+) -> InferredSchema {
+    // If Any sneaked in, the whole thing collapses.
+    if variants.iter().any(|v| matches!(v, InferredSchema::Any)) {
+        return InferredSchema::Any;
+    }
+
+    // Deduplicate Never entries that may have been left by anyof_insert.
+    let variants: Vec<InferredSchema> = variants
+        .into_iter()
+        .filter(|v| !matches!(v, InferredSchema::Never))
+        .collect();
+
+    // Single variant — unwrap and propagate nullable.
+    if variants.len() == 1 {
+        return variants.into_iter().next().unwrap().into_nullable_if(nullable);
+    }
+
+    // Cap check.
+    if cfg.cap_union > 0 && variants.len() > cfg.cap_union {
+        return InferredSchema::Any;
+    }
+
+    InferredSchema::AnyOf { variants, nullable }
 }
 
 // ---------------------------------------------------------------------------
@@ -194,6 +307,19 @@ fn merge_fields(
     a
 }
 
+// ---------------------------------------------------------------------------
+// Helper: conditional nullable promotion
+// ---------------------------------------------------------------------------
+
+trait IntoNullableIf {
+    fn into_nullable_if(self, nullable: bool) -> Self;
+}
+
+impl IntoNullableIf for InferredSchema {
+    fn into_nullable_if(self, nullable: bool) -> Self {
+        if nullable { self.into_nullable() } else { self }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -266,14 +392,11 @@ mod tests {
 
     #[test]
     fn scalar_union_integer_float_normalizes() {
-        // Union already has Float; adding Integer should stay Float scalar
         let mut variants = std::collections::BTreeSet::new();
         variants.insert(ScalarType::Float);
         let u = Union { variants, nullable: false };
         let i = Scalar { ty: ScalarType::Integer, nullable: false };
         let result = lub(u, i, cfg());
-        // Integer is subsumed by Float → should remain a single-variant Union
-        // or collapse to Scalar(Float) — either way Integer must not appear
         match &result {
             Union { variants, .. } => assert!(!variants.contains(&ScalarType::Integer)),
             Scalar { ty: ScalarType::Float, .. } => {}
@@ -282,10 +405,69 @@ mod tests {
     }
 
     #[test]
-    fn structural_conflict_collapses_to_any() {
+    fn structural_conflict_produces_anyof() {
+        // Object + Scalar should now produce AnyOf, not Any
         let o = Object { fields: indexmap::IndexMap::new(), nullable: false };
         let s = Scalar { ty: ScalarType::Str, nullable: false };
-        assert!(matches!(lub(o, s, cfg()), Any));
+        let result = lub(o, s, cfg());
+        assert!(matches!(result, AnyOf { .. }), "expected AnyOf, got {result:?}");
+    }
+
+    #[test]
+    fn array_scalar_produces_anyof() {
+        let a = Array { items: Box::new(Scalar { ty: ScalarType::Integer, nullable: false }), nullable: false };
+        let s = Scalar { ty: ScalarType::Str, nullable: false };
+        let result = lub(a, s, cfg());
+        assert!(matches!(result, AnyOf { .. }), "expected AnyOf, got {result:?}");
+    }
+
+    #[test]
+    fn anyof_merges_same_category() {
+        // AnyOf([String, Object]) + another Object → AnyOf([String, Object])
+        // The two Objects should merge field-wise, not append a second Object arm.
+        use indexmap::indexmap;
+        let o1 = Object {
+            fields: indexmap! { "x".to_string() => FieldInfo { schema: Scalar { ty: ScalarType::Integer, nullable: false }, occurrences: 1 } },
+            nullable: false,
+        };
+        let o2 = Object {
+            fields: indexmap! { "x".to_string() => FieldInfo { schema: Scalar { ty: ScalarType::Integer, nullable: false }, occurrences: 1 } },
+            nullable: false,
+        };
+        let s = Scalar { ty: ScalarType::Str, nullable: false };
+
+        // Build AnyOf([String, Object(x:int)]) first
+        let base = lub(s.clone(), o1, cfg());
+        assert!(matches!(base, AnyOf { .. }));
+
+        // Merge another Object — should merge into existing Object arm, not add a third variant
+        let result = lub(base, o2, cfg());
+        if let AnyOf { variants, .. } = &result {
+            assert_eq!(variants.len(), 2, "expected 2 variants, got {}", variants.len());
+        } else {
+            panic!("expected AnyOf, got {result:?}");
+        }
+    }
+
+    #[test]
+    fn anyof_cap_collapses_to_any() {
+        let small_cfg = MergeConfig { cap_union: 2 };
+        let s = Scalar { ty: ScalarType::Str, nullable: false };
+        let a = Array { items: Box::new(Never), nullable: false };
+        let o = Object { fields: indexmap::IndexMap::new(), nullable: false };
+        // 3 structural variants > cap=2 → Any
+        let step1 = lub(s, a, small_cfg);
+        let result = lub(step1, o, small_cfg);
+        assert!(matches!(result, Any), "expected Any, got {result:?}");
+    }
+
+    #[test]
+    fn anyof_nullable_promotion() {
+        let s = Scalar { ty: ScalarType::Str, nullable: false };
+        let a = Array { items: Box::new(Never), nullable: false };
+        let base = lub(s, a, cfg());
+        let result = lub(base, NullOnly, cfg());
+        assert!(result.is_nullable(), "expected nullable AnyOf");
     }
 
     #[test]
