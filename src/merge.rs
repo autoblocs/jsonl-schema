@@ -114,7 +114,7 @@ pub fn lub(a: InferredSchema, b: InferredSchema, cfg: MergeConfig) -> InferredSc
 
         // AnyOf + anything else — absorb the new type into the AnyOf
         (AnyOf { variants, nullable: na }, other)
-        | (other, AnyOf { variants: variants, nullable: na }) => {
+        | (other, AnyOf { variants, nullable: na }) => {
             let nullable = na || other.is_nullable();
             let mut variants = variants;
             anyof_insert(&mut variants, other, cfg);
