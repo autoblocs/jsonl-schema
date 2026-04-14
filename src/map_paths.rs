@@ -94,6 +94,16 @@ fn apply(schema: InferredSchema, paths: &[Vec<Segment>], cfg: MergeConfig) -> In
         InferredSchema::Array { items, nullable } => {
             apply_to_array(items, nullable, paths, cfg)
         }
+        // Recurse into each AnyOf variant — a map-path might match inside
+        // one of the structural alternatives.
+        InferredSchema::AnyOf { variants, nullable } => {
+            let variants = variants
+                .into_iter()
+                .map(|v| apply(v, paths, cfg))
+                .collect();
+            InferredSchema::AnyOf { variants, nullable }
+        }
+
         // All other variants have no children to recurse into.
         other => other,
     }
